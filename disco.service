@@ -1,0 +1,11 @@
+[Unit]
+Description=disco.py - Host discovery tool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/bin/disco.py --broadcast
+User=pi
+
+[Install]
+WantedBy=multi-user.target

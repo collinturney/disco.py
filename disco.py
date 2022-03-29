@@ -41,14 +41,17 @@ class Disco(object):
         hosts = {}
         start = time.time()
         while True:
-            ready = select.select([self.sock], [], [], 1)
+            try:
+                ready = select.select([self.sock], [], [], 1)
 
-            if ready[0]:
-                msg, addr = self.sock.recvfrom(1024)
-                hosts[addr[0]] = msg.decode()
-                self.log.info(f"Received {addr[0]} : {msg.decode()}")
-            else:
-                self.log.debug("No hosts")
+                if ready[0]:
+                    msg, addr = self.sock.recvfrom(1024)
+                    hosts[addr[0]] = msg.decode()
+                    self.log.info(f"Received {addr[0]} : {msg.decode()}")
+                else:
+                    self.log.debug("No hosts")
+            except Exception:
+                self.log.exception(f"Error receiving on port {port}")
 
             if timeout and time.time() - start >= timeout:
                 return hosts
@@ -58,7 +61,12 @@ class Disco(object):
         while True:
             msg = f"HOST {platform.node()} {int(time.time())}"
             self.log.debug(f"Sending '{msg}' -> {host}:{port}")
-            self.sock.sendto(msg.encode(), (host, port))
+
+            try:
+                self.sock.sendto(msg.encode(), (host, port))
+            except Exception:
+                self.log.exception(f"Error sending to {host}:{port}")
+
             time.sleep(delay)
 
 

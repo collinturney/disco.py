@@ -9,12 +9,15 @@ import select
 import socket
 import sys
 import time
+import zmq
+from zmq.devices import ThreadProxy
 
 
 class Disco(object):
 
     LOG_DEVICE = "/dev/log"
-    HOST = "<broadcast>"
+    IPC_PATH = "ipc:///var/tmp/disco"
+    BROADCAST = "<broadcast>"
     PORT = 9000
     DELAY = 15
 
@@ -30,12 +33,17 @@ class Disco(object):
         else:
             self.log.setLevel(logging.INFO)
 
+
+class DiscoClient(Disco):
+
+    def __init__(self, debug=False):
+        super().__init__(debug)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.setblocking(0)
 
-    def listen(self, port, timeout=None):
+    def listen(self, port, delay=None):
         self.log.info(f"Listening on port {port}...")
         self.sock.bind(("", port))
         hosts = {}
@@ -53,31 +61,45 @@ class Disco(object):
             except Exception:
                 self.log.exception(f"Error receiving on port {port}")
 
-            if timeout and time.time() - start >= timeout:
+            if delay and time.time() - start >= delay:
                 return hosts
 
-    def broadcast(self, host, port, delay):
-        self.log.info(f"Broadcasting to {host}:{port}...")
+
+class DiscoServer(Disco):
+
+    def __init__(self, debug=False):
+        super().__init__(debug)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.sock.setblocking(0)
+
+    def broadcast(self, port, delay):
+        self.log.info(f"Broadcasting on port {port}...")
+
+        proxy = ThreadProxy(zmq.XSUB, zmq.XPUB)
+        proxy.bind_in(Disco.IPC_PATH)
+        proxy.bind_out(f"tcp://*:{port}")
+        proxy.start()
+
         while True:
             msg = f"HOST {platform.node()} {int(time.time())}"
-            self.log.debug(f"Sending '{msg}' -> {host}:{port}")
+            self.log.debug(f"Sending '{msg}' -> {self.BROADCAST}:{port}")
 
             try:
-                self.sock.sendto(msg.encode(), (host, port))
+                self.sock.sendto(msg.encode(), (self.BROADCAST, port))
             except Exception:
-                self.log.exception(f"Error sending to {host}:{port}")
+                self.log.exception(f"Error sending to {self.BROADCAST}:{port}")
 
             time.sleep(delay)
 
 
 def configure():
-    parser = argparse.ArgumentParser(description="disco.py - Host discovery tool")
+    parser = argparse.ArgumentParser(description="disco.py - Host and metric discovery tool")
 
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--listen", "-l", default=False, action="store_true", help="Listen mode")
     mode.add_argument("--broadcast", "-b", default=False, action="store_true", help="Broadcast mode")
-
-    parser.add_argument("--host", default=Disco.HOST, help="Target host (default: UDP broadcast)")
     parser.add_argument("--port", default=Disco.PORT, type=int, help="Target port (default: 9000)")
     parser.add_argument("--delay", default=Disco.DELAY, type=int, help="Broadcast delay in seconds (default: 15)")
     parser.add_argument("--debug", default=False, action="store_true", help="Enable debug output")
@@ -88,19 +110,17 @@ def configure():
 def main():
     args = configure()
 
-    try:
-        disco = Disco(args.debug)
-
-        if args.broadcast:
-            disco.broadcast(args.host, args.port, args.delay)
-        elif args.listen:
-            hosts = disco.listen(args.port)
-    except KeyboardInterrupt:
-        pass
+    if args.broadcast:
+        DiscoServer(args.debug).broadcast(args.port, args.delay)
+    elif args.listen:
+        DiscoClient(args.debug).listen(args.port, args.delay)
 
     return 0
 
 
 if __name__ == "__main__":
-    ret = main()
-    sys.exit(ret)
+    try:
+        ret = main()
+        sys.exit(ret)
+    except KeyboardInterrupt:
+        sys.exit(1)

@@ -64,13 +64,13 @@ class BroadcastServer(Disco):
             time.sleep(delay)
 
 
-class BroadcastClient(Disco):
+class BroadcastReceiver(Disco):
     def __init__(self, debug: bool=False):
         super().__init__(debug)
         self.sock = Disco.udp_socket()
 
     def receive(self, port: int, delay: int=None):
-        self.log.info(f"Listening on port {port}...")
+        self.log.info(f"Listening on UDP port {port}...")
         self.sock.bind(("", port))
         hosts = {}
         start = time.time()
@@ -103,6 +103,7 @@ class MetricsProxy(Disco):
         self.proxy.bind_in(input_endpoint)
         self.proxy.bind_out(output_endpoint)
         self.proxy.start()
+        return self
 
     def join(self):
         self.proxy.join()
@@ -114,7 +115,7 @@ class MetricsPublisher(Disco):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
         self.socket.connect(endpoint)
-        time.sleep(0.05) # zmq slow joiner
+        time.sleep(0.05) # zmq slow join workaround
 
     def publish(self, name: str, value: str):
         self.socket.send_string(f"metric {name} {value}")
@@ -135,7 +136,7 @@ class MetricsReceiver(Disco):
 
 
 def configure():
-    parser = argparse.ArgumentParser(description="disco.py - Host and metrics discovery toolkit")
+    parser = argparse.ArgumentParser(description="disco.py - Host discovery and metrics toolkit")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
     parser.add_argument("--debug", default=False, action="store_true",
@@ -171,19 +172,14 @@ def main():
         if args.send:
             BroadcastServer(args.debug).broadcast(args.port, args.delay)
         elif args.receive:
-            BroadcastClient(args.debug).receive(args.port)
+            BroadcastReceiver(args.debug).receive(args.port)
     elif args.command == "metrics":
         if args.publish:
-            name, value = args.publish
-            MetricsPublisher().publish(name, value)
+            MetricsPublisher().publish(*args.publish)
         elif args.receive:
-            endpoint = args.receive
-            MetricsReceiver().receive(endpoint)
+            MetricsReceiver().receive(args.receive)
         elif args.proxy:
-            input_endpoint, output_endpoint = args.proxy
-            proxy = MetricsProxy()
-            proxy.start(input_endpoint, output_endpoint)
-            proxy.join()
+            MetricsProxy().start(*args.proxy).join()
     else:
         raise ValueError("Invalid command")
 

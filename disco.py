@@ -14,7 +14,6 @@ from zmq.devices import ThreadProxy
 
 
 class Disco(object):
-
     LOG_DEVICE = "/dev/log"
     IPC_PATH = "ipc:///var/tmp/disco"
     BROADCAST = "<broadcast>"
@@ -23,7 +22,9 @@ class Disco(object):
 
     def __init__(self, debug=False):
         self.log = logging.getLogger("Disco")
-        self.log.addHandler(logging.StreamHandler(sys.stdout))
+
+        if not self.log.hasHandlers():
+            self.log.addHandler(logging.StreamHandler(sys.stdout))
 
         if os.path.exists(self.LOG_DEVICE):
             self.log.addHandler(logging.handlers.SysLogHandler(address=self.LOG_DEVICE))
@@ -33,17 +34,42 @@ class Disco(object):
         else:
             self.log.setLevel(logging.INFO)
 
+    @staticmethod
+    def udp_socket():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.setblocking(0)
+        return sock
 
-class DiscoClient(Disco):
 
-    def __init__(self, debug=False):
+class BroadcastServer(Disco):
+    def __init__(self, debug: bool=False):
         super().__init__(debug)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.setblocking(0)
+        self.sock = Disco.udp_socket()
+        self.proxy = MetricsProxy()
 
-    def listen(self, port, delay=None):
+    def broadcast(self, port: int, delay: int):
+        self.log.info(f"Broadcasting on UDP port {port}...")
+        self.proxy.start(MetricsProxy.INPUT_ENDPOINT, MetricsProxy.OUTPUT_ENDPOINT)
+        while True:
+            msg = f"HOST {platform.node()} {int(time.time())}"
+            self.log.debug(f"Sending '{msg}' -> {self.BROADCAST}:{port}")
+
+            try:
+                self.sock.sendto(msg.encode(), (self.BROADCAST, port))
+            except Exception:
+                self.log.exception(f"Error sending to {self.BROADCAST}:{port}")
+
+            time.sleep(delay)
+
+
+class BroadcastClient(Disco):
+    def __init__(self, debug: bool=False):
+        super().__init__(debug)
+        self.sock = Disco.udp_socket()
+
+    def receive(self, port: int, delay: int=None):
         self.log.info(f"Listening on port {port}...")
         self.sock.bind(("", port))
         hosts = {}
@@ -65,44 +91,75 @@ class DiscoClient(Disco):
                 return hosts
 
 
-class DiscoServer(Disco):
+class MetricsProxy(Disco):
+    INPUT_ENDPOINT = Disco.IPC_PATH
+    OUTPUT_ENDPOINT = f"tcp://*:{Disco.PORT}"
 
-    def __init__(self, debug=False):
-        super().__init__(debug)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.setblocking(0)
+    def __init__(self):
+        super().__init__()
+        self.proxy = ThreadProxy(zmq.XSUB, zmq.XPUB)
 
-    def broadcast(self, port, delay):
-        self.log.info(f"Broadcasting on port {port}...")
+    def start(self, input_endpoint: str, output_endpoint: str):
+        self.proxy.bind_in(input_endpoint)
+        self.proxy.bind_out(output_endpoint)
+        self.proxy.start()
 
-        proxy = ThreadProxy(zmq.XSUB, zmq.XPUB)
-        proxy.bind_in(Disco.IPC_PATH)
-        proxy.bind_out(f"tcp://*:{port}")
-        proxy.start()
+    def join(self):
+        self.proxy.join()
 
+
+class MetricsPublisher(Disco):
+    def __init__(self, endpoint: str=Disco.IPC_PATH):
+        super().__init__()
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PUB)
+        self.socket.connect(endpoint)
+        time.sleep(0.05) # zmq slow joiner
+
+    def publish(self, name: str, value: str):
+        self.socket.send_string(f"metric {name} {value}")
+
+
+class MetricsReceiver(Disco):
+    def __init__(self):
+        super().__init__()
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.SUB)
+        self.socket.setsockopt(zmq.SUBSCRIBE, b"")
+
+    def receive(self, endpoint: str):
+        self.socket.connect(endpoint)
         while True:
-            msg = f"HOST {platform.node()} {int(time.time())}"
-            self.log.debug(f"Sending '{msg}' -> {self.BROADCAST}:{port}")
-
-            try:
-                self.sock.sendto(msg.encode(), (self.BROADCAST, port))
-            except Exception:
-                self.log.exception(f"Error sending to {self.BROADCAST}:{port}")
-
-            time.sleep(delay)
+            msg = self.socket.recv()
+            print(msg)
 
 
 def configure():
-    parser = argparse.ArgumentParser(description="disco.py - Host and metric discovery tool")
+    parser = argparse.ArgumentParser(description="disco.py - Host and metrics discovery toolkit")
 
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--listen", "-l", default=False, action="store_true", help="Listen mode")
-    mode.add_argument("--broadcast", "-b", default=False, action="store_true", help="Broadcast mode")
-    parser.add_argument("--port", default=Disco.PORT, type=int, help="Target port (default: 9000)")
-    parser.add_argument("--delay", default=Disco.DELAY, type=int, help="Broadcast delay in seconds (default: 15)")
-    parser.add_argument("--debug", default=False, action="store_true", help="Enable debug output")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--debug", default=False, action="store_true",
+                        help="Enable debug output")
+
+    broadcast = subparsers.add_parser("broadcast", help="UDP broadcast mode")
+    broadcast_mode = broadcast.add_mutually_exclusive_group(required=True)
+    broadcast_mode.add_argument("--send", default=False, action="store_true",
+                                help="Send UDP broadcasts")
+    broadcast_mode.add_argument("--receive", default=False, action="store_true",
+                                help="Receive UDP broadcasts")
+    broadcast.add_argument("--port", default=Disco.PORT, type=int,
+                           help=f"Target port (default: {Disco.PORT})")
+    broadcast.add_argument("--delay", default=Disco.DELAY, type=int,
+                           help=f"Broadcast delay (default: {Disco.DELAY})")
+
+    metrics = subparsers.add_parser("metrics", help="Metrics mode")
+    metrics_mode = metrics.add_mutually_exclusive_group(required=True)
+    metrics_mode.add_argument("--publish", type=str, nargs=2, metavar=('NAME', 'VALUE'),
+                              help="Publish named metric value (e.g., 'temp 73')")
+    metrics_mode.add_argument("--receive", type=str, metavar='ENDPOINT',
+                              help="Host endpoint (e.g., 'tcp://host:port')")
+    metrics_mode.add_argument("--proxy", type=str, nargs=2, metavar=('INPUT_ENDPOINT', 'OUTPUT_ENDPOINT'),
+                              help="Proxy in/out endpoints (e.g., 'ipc:///var/tmp/disco tcp://host:port')")
 
     return parser.parse_args()
 
@@ -110,17 +167,31 @@ def configure():
 def main():
     args = configure()
 
-    if args.broadcast:
-        DiscoServer(args.debug).broadcast(args.port, args.delay)
-    elif args.listen:
-        DiscoClient(args.debug).listen(args.port, args.delay)
+    if args.command == "broadcast":
+        if args.send:
+            BroadcastServer(args.debug).broadcast(args.port, args.delay)
+        elif args.receive:
+            BroadcastClient(args.debug).receive(args.port)
+    elif args.command == "metrics":
+        if args.publish:
+            name, value = args.publish
+            MetricsPublisher().publish(name, value)
+        elif args.receive:
+            endpoint = args.receive
+            MetricsReceiver().receive(endpoint)
+        elif args.proxy:
+            input_endpoint, output_endpoint = args.proxy
+            proxy = MetricsProxy()
+            proxy.start(input_endpoint, output_endpoint)
+            proxy.join()
+    else:
+        raise ValueError("Invalid command")
 
     return 0
 
 
 if __name__ == "__main__":
     try:
-        ret = main()
-        sys.exit(ret)
+        sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(1)

@@ -19,6 +19,7 @@ class Disco(object):
     LOG_DEVICE = "/dev/log"
     IPC_PATH = "ipc:///var/tmp/disco"
     BROADCAST = "<broadcast>"
+    TOPIC = "metric"
     PORT = 9000
     DELAY = 15
 
@@ -140,9 +141,9 @@ class MetricsPublisher(Disco):
     def publish(self, name: str, value: str = None):
         """Publish a named metric value or, if not present, current epoch time."""
         if value:
-            self.socket.send_string(f"metric {name} {value}")
+            self.socket.send_string(f"{Disco.TOPIC} {name} {value}")
         else:
-            self.socket.send_string(f"metric {name} {int(time.time())}")
+            self.socket.send_string(f"{Disco.TOPIC} {name} {int(time.time())}")
 
 
 class MetricsReceiver(Disco):
@@ -150,7 +151,7 @@ class MetricsReceiver(Disco):
         super().__init__()
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
-        self.socket.setsockopt(zmq.SUBSCRIBE, b"")
+        self.socket.setsockopt(zmq.SUBSCRIBE, Disco.TOPIC.encode())
 
     def receive(self, endpoint: str):
         self.socket.connect(endpoint)
@@ -184,7 +185,7 @@ def configure():
     metrics_mode.add_argument("--receive", type=str, metavar='ENDPOINT',
                               help="Host endpoint (e.g., 'tcp://host:port')")
     metrics_mode.add_argument("--proxy", type=str, nargs=2, metavar=('INPUT', 'OUTPUT'),
-                              help="Metrics proxy endpoints (e.g., 'ipc:///var/tmp/disco tcp://*:9000')")
+                              help=f"Metrics proxy endpoints (e.g., '{Disco.IPC_PATH} tcp://*:9000')")
 
     return parser.parse_args()
 

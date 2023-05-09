@@ -14,6 +14,8 @@ from zmq.devices import ThreadProxy
 
 
 class Disco(object):
+    """Disco base class for constants, logging, and socket creation."""
+
     LOG_DEVICE = "/dev/log"
     IPC_PATH = "ipc:///var/tmp/disco"
     BROADCAST = "<broadcast>"
@@ -21,6 +23,7 @@ class Disco(object):
     DELAY = 15
 
     def __init__(self, debug=False):
+        """Create a Disco logger and avoid duplicate handlers."""
         self.log = logging.getLogger("Disco")
 
         if not self.log.hasHandlers():
@@ -36,6 +39,7 @@ class Disco(object):
 
     @staticmethod
     def udp_socket():
+        """Returns a socket configured for UDP broadcasts."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -44,12 +48,16 @@ class Disco(object):
 
 
 class BroadcastServer(Disco):
-    def __init__(self, debug: bool=False):
+    """Broadcast UDP host discovery packets."""
+
+    def __init__(self, debug: bool = False):
+        """Create UDP broadcast socket and create a local metrics proxy."""
         super().__init__(debug)
         self.sock = Disco.udp_socket()
         self.proxy = MetricsProxy()
 
-    def broadcast(self, port: int, delay: int):
+    def broadcast(self, port: int, delay: int = 15):
+        """Broadcast hostname and current time every 'delay' seconds."""
         self.log.info(f"Broadcasting on UDP port {port}...")
         self.proxy.start(MetricsProxy.INPUT_ENDPOINT, MetricsProxy.OUTPUT_ENDPOINT)
         while True:
@@ -65,11 +73,15 @@ class BroadcastServer(Disco):
 
 
 class BroadcastReceiver(Disco):
-    def __init__(self, debug: bool=False):
+    """Report UDP host discovery broadcasts."""
+
+    def __init__(self, debug: bool = False):
+        """Create UDP broadcast socket."""
         super().__init__(debug)
         self.sock = Disco.udp_socket()
 
-    def receive(self, port: int, delay: int=None):
+    def receive(self, port: int, timeout: int = None):
+        """Return hosts discovered within the timeout period."""
         self.log.info(f"Listening on UDP port {port}...")
         self.sock.bind(("", port))
         hosts = {}
@@ -87,38 +99,50 @@ class BroadcastReceiver(Disco):
             except Exception:
                 self.log.exception(f"Error receiving on port {port}")
 
-            if delay and time.time() - start >= delay:
+            if timeout and time.time() - start >= timeout:
                 return hosts
 
 
 class MetricsProxy(Disco):
+    """Collect metrics published on an input socket to an output socket."""
+
     INPUT_ENDPOINT = Disco.IPC_PATH
     OUTPUT_ENDPOINT = f"tcp://*:{Disco.PORT}"
 
     def __init__(self):
+        """Create a zmq xpub/xsub proxy"""
         super().__init__()
         self.proxy = ThreadProxy(zmq.XSUB, zmq.XPUB)
 
     def start(self, input_endpoint: str, output_endpoint: str):
+        """Bind the proxy sockets endpoints and start forwarding messages."""
         self.proxy.bind_in(input_endpoint)
         self.proxy.bind_out(output_endpoint)
         self.proxy.start()
         return self
 
     def join(self):
+        """Join the background proxy thread."""
         self.proxy.join()
 
 
 class MetricsPublisher(Disco):
-    def __init__(self, endpoint: str=Disco.IPC_PATH):
+    """Publish metrics to a configured location."""
+
+    def __init__(self, endpoint: str = Disco.IPC_PATH):
+        """Create and connect a publish socket."""
         super().__init__()
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
         self.socket.connect(endpoint)
-        time.sleep(0.05) # zmq slow join workaround
+        time.sleep(0.05)  # zmq slow join workaround
 
-    def publish(self, name: str, value: str):
-        self.socket.send_string(f"metric {name} {value}")
+    def publish(self, name: str, value: str = None):
+        """Publish a named metric value or, if not present, current epoch time."""
+        if value:
+            self.socket.send_string(f"metric {name} {value}")
+        else:
+            self.socket.send_string(f"metric {name} {int(time.time())}")
 
 
 class MetricsReceiver(Disco):
@@ -159,8 +183,8 @@ def configure():
                               help="Publish named metric value (e.g., 'temp 73')")
     metrics_mode.add_argument("--receive", type=str, metavar='ENDPOINT',
                               help="Host endpoint (e.g., 'tcp://host:port')")
-    metrics_mode.add_argument("--proxy", type=str, nargs=2, metavar=('INPUT_ENDPOINT', 'OUTPUT_ENDPOINT'),
-                              help="Proxy in/out endpoints (e.g., 'ipc:///var/tmp/disco tcp://host:port')")
+    metrics_mode.add_argument("--proxy", type=str, nargs=2, metavar=('INPUT', 'OUTPUT'),
+                              help="Metrics proxy endpoints (e.g., 'ipc:///var/tmp/disco tcp://*:9000')")
 
     return parser.parse_args()
 

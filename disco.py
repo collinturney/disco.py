@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import logging
 import logging.handlers
 import os
@@ -8,6 +9,7 @@ import platform
 import select
 import socket
 import sys
+import threading
 import time
 import zmq
 from zmq.devices import ThreadProxy
@@ -19,7 +21,6 @@ class Disco(object):
     LOG_DEVICE = "/dev/log"
     IPC_PATH = "ipc:///var/tmp/disco"
     BROADCAST = "<broadcast>"
-    TOPIC = "metric"
     PORT = 9000
     DELAY = 15
 
@@ -39,7 +40,7 @@ class Disco(object):
             self.log.setLevel(logging.INFO)
 
     @staticmethod
-    def udp_socket():
+    def udp_socket() -> socket:
         """Returns a socket configured for UDP broadcasts."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -48,27 +49,56 @@ class Disco(object):
         return sock
 
 
-class BroadcastServer(Disco):
-    """Broadcast UDP host discovery packets."""
+class Metric(object):
+    """Disco metric representation."""
 
-    def __init__(self, debug: bool = False):
+    TOPIC = "metric"
+
+    def __init__(self, host: str, values: dict):
+        if not all((host, values)):
+            raise ValueError("Metric requires host and values")
+
+        self.host = host
+        self.values = values
+        self.values.setdefault("_time", time.time())
+
+    def __repr__(self) -> str:
+        return f"Metric(host={self.host} values={json.dumps(self.values)})"
+
+    def serialize(self) -> bytes:
+        return f"{Metric.TOPIC} {self.host} {json.dumps(self.values)}".encode()
+
+    @staticmethod
+    def parse(data: bytes) -> "Metric":
+        msg = data.decode().strip().removeprefix(f"{Metric.TOPIC} ")
+        host, values = msg.split(" ", 1)
+        return Metric(host, json.loads(values))
+
+
+class BroadcastPublisher(Disco):
+    """Publish UDP host discovery packets."""
+
+    def __init__(self, **kwargs):
         """Create UDP broadcast socket and create a local metrics proxy."""
+        debug = kwargs.get("debug", False)
+        self.port = kwargs.get("port", Disco.PORT)
+        
         super().__init__(debug)
         self.sock = Disco.udp_socket()
         self.proxy = MetricsProxy()
 
-    def broadcast(self, port: int, delay: int = 15):
+    def publish(self, delay: int = Disco.DELAY):
         """Broadcast hostname and current time every 'delay' seconds."""
-        self.log.info(f"Broadcasting on UDP port {port}...")
-        self.proxy.start(MetricsProxy.INPUT_ENDPOINT, MetricsProxy.OUTPUT_ENDPOINT)
+        self.log.info(f"Broadcasting on UDP port {self.port}")
+        self.proxy.start()
         while True:
             msg = f"HOST {platform.node()} {int(time.time())}"
-            self.log.debug(f"Sending '{msg}' -> {self.BROADCAST}:{port}")
+            self.log.debug(f"Sending '{msg}' -> {self.BROADCAST}:{self.port}")
 
             try:
-                self.sock.sendto(msg.encode(), (self.BROADCAST, port))
+                self.sock.sendto(msg.encode(), (self.BROADCAST, self.port))
             except Exception:
-                self.log.exception(f"Error sending to {self.BROADCAST}:{port}")
+                self.log.exception(f"Error sending to {self.BROADCAST}:{self.port}")
 
             time.sleep(delay)
 
@@ -76,15 +106,18 @@ class BroadcastServer(Disco):
 class BroadcastReceiver(Disco):
     """Report UDP host discovery broadcasts."""
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, **kwargs):
         """Create UDP broadcast socket."""
+        debug = kwargs.get("debug", False)
+        self.port = kwargs.get("port", Disco.PORT)
+
         super().__init__(debug)
         self.sock = Disco.udp_socket()
+        self.sock.bind(("", self.port))
 
-    def receive(self, port: int, timeout: int = None):
+    def receive(self, timeout: int = None) -> dict:
         """Return hosts discovered within the timeout period."""
-        self.log.info(f"Listening on UDP port {port}...")
-        self.sock.bind(("", port))
+        self.log.debug(f"Listening for broadcasts on UDP port {self.port}")
         hosts = {}
         start = time.time()
         while True:
@@ -94,9 +127,7 @@ class BroadcastReceiver(Disco):
                 if ready[0]:
                     msg, addr = self.sock.recvfrom(1024)
                     hosts[addr[0]] = msg.decode()
-                    self.log.info(f"Received {addr[0]} : {msg.decode()}")
-                else:
-                    self.log.debug("No hosts")
+                    self.log.debug(f"Received broadcast from {addr[0]} : {msg.decode()}")
             except Exception:
                 self.log.exception(f"Error receiving on port {port}")
 
@@ -107,18 +138,20 @@ class BroadcastReceiver(Disco):
 class MetricsProxy(Disco):
     """Collect metrics published on an input socket to an output socket."""
 
-    INPUT_ENDPOINT = Disco.IPC_PATH
-    OUTPUT_ENDPOINT = f"tcp://*:{Disco.PORT}"
+    def __init__(self, **kwargs):
+        """Create a zmq xpub/xsub proxy and bind its sockets."""
+        debug = kwargs.get("debug", False)
+        self.frontend = kwargs.get("frontend", Disco.IPC_PATH)
+        self.backend = kwargs.get("backend", f"tcp://*:{Disco.PORT}")
 
-    def __init__(self):
-        """Create a zmq xpub/xsub proxy"""
-        super().__init__()
+        super().__init__(debug)
         self.proxy = ThreadProxy(zmq.XSUB, zmq.XPUB)
+        self.proxy.bind_in(self.frontend)
+        self.proxy.bind_out(self.backend)
 
-    def start(self, input_endpoint: str, output_endpoint: str):
-        """Bind the proxy sockets endpoints and start forwarding messages."""
-        self.proxy.bind_in(input_endpoint)
-        self.proxy.bind_out(output_endpoint)
+    def start(self) -> "MetricsProxy":
+        """Begin forwarding messages."""
+        self.log.info(f"Proxying metrics ('{self.frontend}' -> '{self.backend}')")
         self.proxy.start()
         return self
 
@@ -128,44 +161,99 @@ class MetricsProxy(Disco):
 
 
 class MetricsPublisher(Disco):
-    """Publish metrics to a configured location."""
+    """Publish metric values to a configured endpoint."""
 
-    def __init__(self, endpoint: str = Disco.IPC_PATH):
-        """Create and connect a publish socket."""
-        super().__init__()
+    def __init__(self, **kwargs):
+        """Create and connect a publishing socket."""
+        debug = kwargs.get("debug", False)
+        endpoint = kwargs.get("endpoint", Disco.IPC_PATH)
+        self.host = kwargs.get("host", platform.node())
+
+        super().__init__(debug)
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
         self.socket.connect(endpoint)
         time.sleep(0.05)  # zmq slow join workaround
 
-    def publish(self, name: str, value: str = None):
-        """Publish a named metric value or, if not present, current epoch time."""
-        if value:
-            self.socket.send_string(f"{Disco.TOPIC} {name} {value}")
-        else:
-            self.socket.send_string(f"{Disco.TOPIC} {name} {int(time.time())}")
+    def publish(self, values: dict):
+        """Publish metric values."""
+        metric = Metric(self.host, values)
+        self.socket.send(metric.serialize())
 
 
 class MetricsReceiver(Disco):
-    def __init__(self):
-        super().__init__()
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.SUB)
-        self.socket.setsockopt(zmq.SUBSCRIBE, Disco.TOPIC.encode())
+    """Discover new hosts and consolidate their published metrics."""
 
-    def receive(self, endpoint: str):
-        self.socket.connect(endpoint)
+    def __init__(self, **kwargs):
+        """Initialize host tracking sets, sub/re-pub sockets, and BroadcastReceiver."""
+        debug = kwargs.get("debug", False)
+        endpoint = kwargs.get("endpoint", Disco.IPC_PATH)
+
+        super().__init__(debug)
+        self.new_hosts = set()
+        self.connected_hosts = set()
+
+        self.broadcast = BroadcastReceiver(debug=debug, port=Disco.PORT)
+
+        self.context = zmq.Context()
+        self.metric_subs = self.context.socket(zmq.SUB)
+        self.metric_subs.setsockopt(zmq.SUBSCRIBE, Metric.TOPIC.encode())
+
+        self.metric_repub = self.context.socket(zmq.PUB)
+        self.metric_repub.connect(endpoint)
+        time.sleep(0.05)  # zmq slow join workaround
+
+        self.lock = threading.Lock()
+        self.discovery = threading.Thread(target=self._discover_hosts)
+        self.discovery.start()
+
+    def receive(self):
+        """Loop for receiving metrics and updating metrics host connections."""
+        poller = zmq.Poller()
+        poller.register(self.metric_subs)
+
         while True:
-            msg = self.socket.recv()
-            print(msg)
+            sockets = dict(poller.poll(1000))
+
+            if self.metric_subs in sockets and sockets[self.metric_subs] == zmq.POLLIN:
+                msg = self.metric_subs.recv()
+                self._process(msg)
+
+            self._connect_new_hosts()
+
+    def _process(self, msg: str):
+        """Process a metrics message."""
+        try:
+            metric = Metric.parse(msg)
+            self.log.info(metric)
+            self.metric_repub.send(metric.serialize())
+        except Exception:
+            self.log.exception(f"Error processing metrics message: {msg}")
+
+    def _discover_hosts(self):
+        """Listen for host broadcasts."""
+        while True:
+            hosts = self.broadcast.receive(10)
+            self.lock.acquire()
+            self.new_hosts = hosts
+            self.lock.release()
+
+    def _connect_new_hosts(self):
+        """Ensure all new hosts are connected for metrics."""
+        self.lock.acquire()
+        for host in self.new_hosts:
+            if host not in self.connected_hosts:
+                self.log.info(f"Connecting new metrics host: {host}")
+                self.metric_subs.connect(f"tcp://{host}:{Disco.PORT}")
+                self.connected_hosts.add(host)
+        self.new_hosts.clear()
+        self.lock.release()
 
 
 def configure():
     parser = argparse.ArgumentParser(description="disco.py - Host discovery and metrics toolkit")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
-    parser.add_argument("--debug", default=False, action="store_true",
-                        help="Enable debug output")
 
     broadcast = subparsers.add_parser("broadcast", help="UDP broadcast mode")
     broadcast_mode = broadcast.add_mutually_exclusive_group(required=True)
@@ -173,19 +261,29 @@ def configure():
                                 help="Send UDP broadcasts")
     broadcast_mode.add_argument("--receive", default=False, action="store_true",
                                 help="Receive UDP broadcasts")
+
     broadcast.add_argument("--port", default=Disco.PORT, type=int,
                            help=f"Target port (default: {Disco.PORT})")
     broadcast.add_argument("--delay", default=Disco.DELAY, type=int,
                            help=f"Broadcast delay (default: {Disco.DELAY})")
+    broadcast.add_argument("--debug", default=False, action="store_true",
+                           help="Enable debug output")
 
     metrics = subparsers.add_parser("metrics", help="Metrics mode")
     metrics_mode = metrics.add_mutually_exclusive_group(required=True)
     metrics_mode.add_argument("--publish", type=str, nargs=2, metavar=('NAME', 'VALUE'),
                               help="Publish named metric value (e.g., 'temp 73')")
-    metrics_mode.add_argument("--receive", type=str, metavar='ENDPOINT',
-                              help="Host endpoint (e.g., 'tcp://host:port')")
-    metrics_mode.add_argument("--proxy", type=str, nargs=2, metavar=('INPUT', 'OUTPUT'),
-                              help=f"Metrics proxy endpoints (e.g., '{Disco.IPC_PATH} tcp://*:9000')")
+    metrics_mode.add_argument("--receive", default=False, action="store_true",
+                              help="Report metrics from all discovered hosts")
+    metrics_mode.add_argument("--proxy", default=False, action="store_true",
+                              help="Metrics proxy mode")
+
+    metrics.add_argument("--frontend", type=str, default=f"{Disco.IPC_PATH}",
+                         help=f"Proxy frontend (e.g., {Disco.IPC_PATH})")
+    metrics.add_argument("--backend", type=str, default=f"tcp://*:{Disco.PORT}",
+                         help=f"Proxy backend (e.g., tcp://*:{Disco.PORT})")
+    metrics.add_argument("--debug", default=False, action="store_true",
+                         help="Enable debug output")
 
     return parser.parse_args()
 
@@ -195,16 +293,19 @@ def main():
 
     if args.command == "broadcast":
         if args.send:
-            BroadcastServer(args.debug).broadcast(args.port, args.delay)
+            BroadcastPublisher(debug=True, port=args.port).publish(args.delay)
         elif args.receive:
-            BroadcastReceiver(args.debug).receive(args.port)
+            BroadcastReceiver(debug=True, port=args.port).receive()
     elif args.command == "metrics":
         if args.publish:
-            MetricsPublisher().publish(*args.publish)
+            name, value = args.publish
+            MetricsPublisher(debug=args.debug).publish({name: value})
         elif args.receive:
-            MetricsReceiver().receive(args.receive)
+            MetricsReceiver(debug=args.debug).receive()
         elif args.proxy:
-            MetricsProxy().start(*args.proxy).join()
+            proxy = MetricsProxy(frontend=args.frontend, backend=args.backend)
+            proxy.start()
+            proxy.join()
     else:
         raise ValueError("Invalid command")
 

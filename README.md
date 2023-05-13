@@ -9,7 +9,7 @@ A host discovery and metrics toolkit for IoT devices (e.g., Raspberry Pi).
 Periodically send out UDP broadcasts that include host information.
 
 ```
-./disco.py broadcast --send
+➤ ./disco.py broadcast --send
 Broadcasting on UDP port 9000
 ```
 
@@ -48,7 +48,7 @@ optional arguments:
 Publish metrics from the command line.
 
 ```
-./disco.py metrics --publish temperature 73
+➤ ./disco.py metrics --publish temperature 73
 ```
 
 Discover new hosts and receive any metrics that they may publish.

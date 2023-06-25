@@ -84,3 +84,12 @@ optional arguments:
   --backend BACKEND     Proxy backend (e.g., tcp://*:9000)
   --debug               Enable debug output
 ```
+
+## Installation
+
+Run the install script to register and enable the disco systemd service. The 
+service will begin sending host discovery broadcasts and proxying host metrics.
+
+```
+➤ ./install.sh disco.service
+```

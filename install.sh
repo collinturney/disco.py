@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -ex
 
 if [ $# != 1 ]; then
     echo "Usage: $0 SVC_FILE"
@@ -7,7 +7,9 @@ fi
 
 SVC=$1
 
-sudo mv $SVC /lib/systemd/system/
+sudo mkdir -p /opt/bin/
+sudo cp -p *.py /opt/bin/
+sudo cp $SVC /lib/systemd/system/
 sudo chmod 644 /lib/systemd/system/$SVC
 sudo systemctl daemon-reload
 sudo systemctl enable $SVC

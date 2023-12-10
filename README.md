@@ -1,4 +1,4 @@
-# disco.py
+# 🔮 disco.py
 
 A host discovery and metrics toolkit for IoT devices (e.g., Raspberry Pi).
 

@@ -11,6 +11,7 @@ import socket
 import sys
 import threading
 import time
+import queue
 import zmq
 from zmq.devices import ThreadProxy
 
@@ -199,16 +200,29 @@ class MetricsReceiver(Disco):
         self.metric_subs = self.context.socket(zmq.SUB)
         self.metric_subs.setsockopt(zmq.SUBSCRIBE, Metric.TOPIC.encode())
 
-        self.metric_repub = self.context.socket(zmq.PUB)
-        self.metric_repub.connect(endpoint)
-        time.sleep(0.05)  # zmq slow join workaround
-
         self.lock = threading.Lock()
         self.discovery = threading.Thread(target=self._discover_hosts)
         self.discovery.start()
 
-    def receive(self):
-        """Loop for receiving metrics and updating metrics host connections."""
+        self.metrics_queue = queue.Queue(maxsize=10_000)
+
+        self.receiver = threading.Thread(target=self._receive)
+        self.receiver.start()
+
+    def get_metric(self):
+        """Return the next metric from the FIFO queue."""
+        return self.metrics_queue.get(block=True, timeout=None)
+
+    def _discover_hosts(self):
+        """Listen for host broadcasts."""
+        while True:
+            hosts = self.broadcast.receive(10)
+            self.lock.acquire()
+            self.new_hosts = hosts
+            self.lock.release()
+
+    def _receive(self):
+        """Receive metrics and update metrics host connections."""
         poller = zmq.Poller()
         poller.register(self.metric_subs)
 
@@ -222,21 +236,12 @@ class MetricsReceiver(Disco):
             self._connect_new_hosts()
 
     def _process(self, msg: str):
-        """Process a metrics message."""
+        """Parse and enqueue an incoming metric message."""
         try:
             metric = Metric.parse(msg)
-            self.log.info(metric)
-            self.metric_repub.send(metric.serialize())
+            self.metrics_queue.put(metric, block=True, timeout=None)
         except Exception:
             self.log.exception(f"Error processing metrics message: {msg}")
-
-    def _discover_hosts(self):
-        """Listen for host broadcasts."""
-        while True:
-            hosts = self.broadcast.receive(10)
-            self.lock.acquire()
-            self.new_hosts = hosts
-            self.lock.release()
 
     def _connect_new_hosts(self):
         """Ensure all new hosts are connected for metrics."""
@@ -301,7 +306,9 @@ def main():
             name, value = args.publish
             MetricsPublisher(debug=args.debug).publish({name: value})
         elif args.receive:
-            MetricsReceiver(debug=args.debug).receive()
+            receiver = MetricsReceiver(debug=args.debug)
+            while True:
+                print(receiver.get_metric())
         elif args.proxy:
             proxy = MetricsProxy(frontend=args.frontend, backend=args.backend)
             proxy.start()

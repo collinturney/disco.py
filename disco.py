@@ -186,7 +186,7 @@ class MetricsReceiver(Disco):
     """Discover new hosts and consolidate their published metrics."""
 
     def __init__(self, **kwargs):
-        """Initialize host tracking sets, sub/re-pub sockets, and BroadcastReceiver."""
+        """Initialize host tracking, sockets, and BroadcastReceiver."""
         debug = kwargs.get("debug", False)
         endpoint = kwargs.get("endpoint", Disco.IPC_PATH)
 
@@ -200,6 +200,8 @@ class MetricsReceiver(Disco):
         self.metric_subs = self.context.socket(zmq.SUB)
         self.metric_subs.setsockopt(zmq.SUBSCRIBE, Metric.TOPIC.encode())
 
+        self.running = True
+
         self.lock = threading.Lock()
         self.discovery = threading.Thread(target=self._discover_hosts)
         self.discovery.start()
@@ -211,11 +213,20 @@ class MetricsReceiver(Disco):
 
     def get_metric(self):
         """Return the next metric from the FIFO queue."""
-        return self.metrics_queue.get(block=True, timeout=None)
+        try:
+            return self.metrics_queue.get(block=True, timeout=1)
+        except queue.Empty:
+            return None
+
+    def shutdown(self):
+        """Shutdown and join background threads."""
+        self.running = False
+        self.discovery.join()
+        self.receiver.join()
 
     def _discover_hosts(self):
         """Listen for host broadcasts."""
-        while True:
+        while self.running:
             hosts = self.broadcast.receive(10)
             self.lock.acquire()
             self.new_hosts = hosts
@@ -226,7 +237,7 @@ class MetricsReceiver(Disco):
         poller = zmq.Poller()
         poller.register(self.metric_subs)
 
-        while True:
+        while self.running:
             sockets = dict(poller.poll(1000))
 
             if self.metric_subs in sockets and sockets[self.metric_subs] == zmq.POLLIN:

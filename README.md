@@ -1,19 +1,20 @@
 # 🔮 disco.py
 
-A host discovery and metrics toolkit for IoT devices (e.g., Raspberry Pi).
+A brokerless event and metrics toolkit for Linux based IoT devices.
+
 
 ## Broadcast Mode
 
 ### Examples
 
-Periodically send out UDP broadcasts that include host information.
+Periodically send UDP broadcasts that include host information.
 
 ```
 ➤ ./disco.py broadcast --send
 Broadcasting on UDP port 9000
 ```
 
-Receive and report all UDP broadcasts.
+Report UDP broadcasts.
 
 ```
 ➤ ./disco.py broadcast --receive
@@ -51,7 +52,7 @@ Publish metrics from the command line.
 ➤ ./disco.py metrics --publish temperature 73
 ```
 
-Discover new hosts and receive any metrics that they may publish.
+Discover new hosts and report their published metrics.
 
 ```
 ➤ ./disco.py metrics --receive

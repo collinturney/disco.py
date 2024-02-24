@@ -83,7 +83,7 @@ class BroadcastPublisher(Disco):
         """Create UDP broadcast socket and create a local metrics proxy."""
         debug = kwargs.get("debug", False)
         self.port = kwargs.get("port", Disco.PORT)
-        
+
         super().__init__(debug)
         self.sock = Disco.udp_socket()
         self.proxy = MetricsProxy()
@@ -187,29 +187,25 @@ class MetricsReceiver(Disco):
 
     def __init__(self, **kwargs):
         """Initialize host tracking, sockets, and BroadcastReceiver."""
-        debug = kwargs.get("debug", False)
-        endpoint = kwargs.get("endpoint", Disco.IPC_PATH)
-
-        super().__init__(debug)
-        self.new_hosts = set()
-        self.connected_hosts = set()
-
-        self.broadcast = BroadcastReceiver(debug=debug, port=Disco.PORT)
+        self.debug = kwargs.get("debug", False)
+        super().__init__(self.debug)
 
         self.context = zmq.Context()
-        self.metric_subs = self.context.socket(zmq.SUB)
-        self.metric_subs.setsockopt(zmq.SUBSCRIBE, Metric.TOPIC.encode())
 
+        # delay (in seconds) between sub socket resets
+        self.reset_delay = kwargs.get("reset_delay", 3600)
+        # last reset time
+        self.reset_time = time.time()
+
+        self.new_hosts = set()
+        self.connected_hosts = set()
         self.running = True
-
         self.lock = threading.Lock()
-        self.discovery = threading.Thread(target=self._discover_hosts)
-        self.discovery.start()
-
         self.metrics_queue = queue.Queue(maxsize=10_000)
 
-        self.receiver = threading.Thread(target=self._receive)
-        self.receiver.start()
+        self._initialize_sub_socket()
+        self._start_host_discovery()
+        self._start_metrics_receiver()
 
     def get_metric(self):
         """Return the next metric from the FIFO queue."""
@@ -224,7 +220,23 @@ class MetricsReceiver(Disco):
         self.discovery.join()
         self.receiver.join()
 
-    def _discover_hosts(self):
+    def _initialize_sub_socket(self):
+        """Create and configure sub socket."""
+        self.metric_subs = self.context.socket(zmq.SUB)
+        self.metric_subs.setsockopt(zmq.SUBSCRIBE, Metric.TOPIC.encode())
+
+    def _start_host_discovery(self):
+        """Start host discovery thread."""
+        self.broadcast = BroadcastReceiver(debug=self.debug, port=Disco.PORT)
+        self.discovery = threading.Thread(target=self._receive_broadcasts)
+        self.discovery.start()
+
+    def _start_metrics_receiver(self):
+        """Start metrics receiver thread."""
+        self.receiver = threading.Thread(target=self._receive_metrics)
+        self.receiver.start()
+
+    def _receive_broadcasts(self):
         """Listen for host broadcasts."""
         while self.running:
             hosts = self.broadcast.receive(10)
@@ -232,7 +244,7 @@ class MetricsReceiver(Disco):
             self.new_hosts = hosts
             self.lock.release()
 
-    def _receive(self):
+    def _receive_metrics(self):
         """Receive metrics and update metrics host connections."""
         poller = zmq.Poller()
         poller.register(self.metric_subs)
@@ -244,7 +256,16 @@ class MetricsReceiver(Disco):
                 msg = self.metric_subs.recv()
                 self._process(msg)
 
-            self._connect_new_hosts()
+            if self.reset_delay and time.time() - self.reset_time >= self.reset_delay:
+                self.reset_time = time.time()
+                # unregister sub socket with the active poller
+                poller.unregister(self.metric_subs)
+                # reset sub socket and connected host state
+                self._reset_connections()
+                # re-register new sub socket with the active poller
+                poller.register(self.metric_subs)
+            else:
+                self._connect_new_hosts()
 
     def _process(self, msg: str):
         """Parse and enqueue an incoming metric message."""
@@ -263,6 +284,15 @@ class MetricsReceiver(Disco):
                 self.metric_subs.connect(f"tcp://{host}:{Disco.PORT}")
                 self.connected_hosts.add(host)
         self.new_hosts.clear()
+        self.lock.release()
+
+    def _reset_connections(self):
+        """Reset all metrics host connections."""
+        self.log.info("Resetting all metrics host connections")
+        self.lock.acquire()
+        self.metric_subs.close()
+        self._initialize_sub_socket()
+        self.connected_hosts.clear()
         self.lock.release()
 
 
@@ -319,7 +349,10 @@ def main():
         elif args.receive:
             receiver = MetricsReceiver(debug=args.debug)
             while True:
-                print(receiver.get_metric())
+                metric = receiver.get_metric()
+
+                if metric:
+                    print(metric)
         elif args.proxy:
             proxy = MetricsProxy(frontend=args.frontend, backend=args.backend)
             proxy.start()

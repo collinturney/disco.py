@@ -1,4 +1,4 @@
-# 🔮 disco.py
+# 🪩 disco.py
 
 A brokerless event and metrics toolkit for Linux based IoT devices.
 
